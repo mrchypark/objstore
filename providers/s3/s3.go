@@ -550,13 +550,34 @@ func (b *Bucket) Upload(ctx context.Context, name string, r io.Reader, opts ...o
 		partSize = 0
 	}
 
-	// Cloning map since minio may modify it
-	userMetadata := make(map[string]string, len(b.putUserMetadata))
+	uploadOpts := objstore.ApplyObjectUploadOptions(opts...)
+
+	// 기존 putUserMetadata와 새로운 사용자 메타데이터 통합
+	// Merge existing putUserMetadata with new user metadata from options
+	userMetadata := make(map[string]string, len(b.putUserMetadata)+len(uploadOpts.UserMetadata))
+
+	// 먼저 기존 설정 메타데이터 복사
+	// First copy existing configuration metadata
 	for k, v := range b.putUserMetadata {
 		userMetadata[k] = v
 	}
 
-	uploadOpts := objstore.ApplyObjectUploadOptions(opts...)
+	// 새로운 사용자 메타데이터가 있으면 검증하고 추가 (기존 키 덮어쓰기)
+	// If new user metadata exists, validate and add it (overwriting existing keys)
+	if uploadOpts.UserMetadata != nil {
+		// 메타데이터 검증
+		// Validate metadata
+		if err := objstore.ValidateUserMetadata(uploadOpts.UserMetadata); err != nil {
+			return errors.Wrap(err, "invalid user metadata")
+		}
+
+		// S3용 메타데이터 변환 및 병합
+		// Transform metadata for S3 and merge
+		transformedMetadata := objstore.TransformMetadataForS3(uploadOpts.UserMetadata)
+		for k, v := range transformedMetadata {
+			userMetadata[k] = v
+		}
+	}
 
 	if _, err := b.client.PutObject(
 		ctx,
@@ -598,9 +619,29 @@ func (b *Bucket) Attributes(ctx context.Context, name string) (objstore.ObjectAt
 		return objstore.ObjectAttributes{}, err
 	}
 
+	// 사용자 메타데이터 추출 및 변환
+	// Extract and transform user metadata
+	var userMetadata map[string]string
+	if objInfo.UserMetadata != nil && len(objInfo.UserMetadata) > 0 {
+		userMetadata = make(map[string]string, len(objInfo.UserMetadata))
+		for key, value := range objInfo.UserMetadata {
+			// S3는 사용자 메타데이터 키에서 "x-amz-meta-" 접두사를 제거하여 반환
+			// S3 removes "x-amz-meta-" prefix from user metadata keys when returning
+			// minio-go 라이브러리가 이미 접두사를 제거해서 반환하므로 그대로 사용
+			// minio-go library already removes the prefix, so use as-is
+			userMetadata[key] = value
+		}
+	}
+
+	// ETag 정규화 (따옴표 제거)
+	// Normalize ETag (remove quotes)
+	etag := objstore.NormalizeETag(objInfo.ETag)
+
 	return objstore.ObjectAttributes{
 		Size:         objInfo.Size,
 		LastModified: objInfo.LastModified,
+		ETag:         etag,
+		UserMetadata: userMetadata,
 	}, nil
 }
 

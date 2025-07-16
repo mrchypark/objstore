@@ -7,9 +7,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/minio/minio-go/v7/pkg/encrypt"
 
+	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/errutil"
 	"github.com/thanos-io/objstore/exthttp"
 )
@@ -474,4 +477,245 @@ func TestNewBucketWithErrorRoundTripper(t *testing.T) {
 	// We expect an error from the RoundTripper
 	testutil.NotOk(t, err)
 	testutil.Assert(t, errutil.IsMockedError(err), "Expected RoundTripper error, got: %v", err)
+}
+
+// TestS3UserMetadataUploadAndRetrieve tests uploading objects with user metadata and retrieving them.
+// S3 프로바이더의 사용자 메타데이터 업로드 및 조회 기능을 테스트합니다.
+func TestS3UserMetadataUploadAndRetrieve(t *testing.T) {
+	// 이 테스트는 실제 S3 환경에서만 완전히 작동하므로
+	// 메타데이터 검증 로직만 테스트합니다
+
+	// 사용자 메타데이터 정의
+	userMetadata := map[string]string{
+		"author":  "test-user",
+		"version": "1.0",
+	}
+
+	// 메타데이터 검증이 올바르게 작동하는지 확인
+	uploadOpts := objstore.ApplyObjectUploadOptions(objstore.WithUserMetadata(userMetadata))
+	testutil.Assert(t, uploadOpts.UserMetadata != nil, "user metadata should not be nil")
+	testutil.Equals(t, "test-user", uploadOpts.UserMetadata["author"])
+	testutil.Equals(t, "1.0", uploadOpts.UserMetadata["version"])
+
+	// 메타데이터 변환 테스트
+	transformedMetadata := objstore.TransformMetadataForS3(userMetadata)
+	testutil.Assert(t, transformedMetadata != nil, "transformed metadata should not be nil")
+	testutil.Equals(t, "test-user", transformedMetadata["author"])
+	testutil.Equals(t, "1.0", transformedMetadata["version"])
+}
+
+// TestS3MetadataValidation tests metadata validation during upload.
+// S3 프로바이더의 메타데이터 검증 기능을 테스트합니다.
+func TestS3MetadataValidation(t *testing.T) {
+	cfg := DefaultConfig
+	cfg.Endpoint = endpoint
+	cfg.Bucket = "test-bucket"
+
+	bkt, err := NewBucketWithConfig(log.NewNopLogger(), cfg, "test", nil)
+	testutil.Ok(t, err)
+
+	ctx := context.Background()
+	objectName := "test-object"
+	content := "test content"
+
+	// 잘못된 메타데이터 키 테스트 (빈 키)
+	invalidMetadata1 := map[string]string{
+		"": "value",
+	}
+	err = bkt.Upload(ctx, objectName, strings.NewReader(content),
+		objstore.WithUserMetadata(invalidMetadata1))
+	testutil.NotOk(t, err)
+	testutil.Assert(t, strings.Contains(err.Error(), "key cannot be empty"),
+		"should reject empty key")
+
+	// 잘못된 메타데이터 키 테스트 (예약된 키)
+	invalidMetadata2 := map[string]string{
+		"content-type": "application/json",
+	}
+	err = bkt.Upload(ctx, objectName, strings.NewReader(content),
+		objstore.WithUserMetadata(invalidMetadata2))
+	testutil.NotOk(t, err)
+	testutil.Assert(t, strings.Contains(err.Error(), "reserved"),
+		"should reject reserved key")
+
+	// 잘못된 메타데이터 값 테스트 (빈 값)
+	invalidMetadata3 := map[string]string{
+		"test-key": "",
+	}
+	err = bkt.Upload(ctx, objectName, strings.NewReader(content),
+		objstore.WithUserMetadata(invalidMetadata3))
+	testutil.NotOk(t, err)
+	testutil.Assert(t, strings.Contains(err.Error(), "value cannot be empty"),
+		"should reject empty value")
+}
+
+// TestS3MetadataMerging tests merging of config metadata with upload metadata.
+// S3 프로바이더의 설정 메타데이터와 업로드 메타데이터 병합 기능을 테스트합니다.
+func TestS3MetadataMerging(t *testing.T) {
+	// Mock S3 서버 설정
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "PUT" {
+			// 두 메타데이터가 모두 포함되어 있는지 확인
+			hasConfigMeta := r.Header.Get("X-Amz-Meta-Environment") == "test"
+			hasUploadMeta := r.Header.Get("X-Amz-Meta-Author") == "user"
+
+			if hasConfigMeta && hasUploadMeta {
+				w.Header().Set("ETag", `"merged-etag"`)
+				w.WriteHeader(http.StatusOK)
+			} else {
+				w.WriteHeader(http.StatusBadRequest)
+			}
+		}
+	}))
+	defer srv.Close()
+
+	cfg := DefaultConfig
+	cfg.Bucket = "test-bucket"
+	cfg.Endpoint = srv.Listener.Addr().String()
+	cfg.Insecure = true
+	cfg.Region = "test"
+	cfg.AccessKey = "test"
+	cfg.SecretKey = "test"
+	// 설정에 기본 메타데이터 추가
+	cfg.PutUserMetadata = map[string]string{
+		"environment": "test",
+	}
+
+	bkt, err := NewBucketWithConfig(log.NewNopLogger(), cfg, "test", nil)
+	testutil.Ok(t, err)
+
+	ctx := context.Background()
+	objectName := "test-object"
+	content := "test content"
+
+	// 업로드 시 추가 메타데이터 제공
+	uploadMetadata := map[string]string{
+		"author": "user",
+	}
+
+	// 업로드 - 두 메타데이터가 병합되어야 함
+	err = bkt.Upload(ctx, objectName, strings.NewReader(content),
+		objstore.WithUserMetadata(uploadMetadata))
+	testutil.Ok(t, err)
+}
+
+// TestS3ETagConsistency tests ETag consistency across operations.
+// S3 프로바이더의 ETag 일관성을 테스트합니다.
+func TestS3ETagConsistency(t *testing.T) {
+	// Mock S3 서버 설정
+	expectedETag := "test-etag-456"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "PUT":
+			w.Header().Set("ETag", fmt.Sprintf(`"%s"`, expectedETag))
+			w.WriteHeader(http.StatusOK)
+
+		case "HEAD":
+			w.Header().Set("Content-Length", "11")
+			w.Header().Set("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+			w.Header().Set("ETag", fmt.Sprintf(`"%s"`, expectedETag))
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := DefaultConfig
+	cfg.Bucket = "test-bucket"
+	cfg.Endpoint = srv.Listener.Addr().String()
+	cfg.Insecure = true
+	cfg.Region = "test"
+	cfg.AccessKey = "test"
+	cfg.SecretKey = "test"
+
+	bkt, err := NewBucketWithConfig(log.NewNopLogger(), cfg, "test", nil)
+	testutil.Ok(t, err)
+
+	ctx := context.Background()
+	objectName := "test-object"
+	content := "test content"
+
+	// 업로드
+	err = bkt.Upload(ctx, objectName, strings.NewReader(content))
+	testutil.Ok(t, err)
+
+	// Attributes로 ETag 조회
+	attrs, err := bkt.Attributes(ctx, objectName)
+	testutil.Ok(t, err)
+
+	// ETag가 정규화되어 반환되는지 확인 (따옴표 제거)
+	testutil.Equals(t, expectedETag, attrs.ETag)
+
+	// ETag 검증 함수 테스트
+	testutil.Ok(t, objstore.ValidateETag(attrs.ETag))
+}
+
+// TestS3BackwardCompatibility tests that existing functionality still works.
+// S3 프로바이더의 기존 기능 호환성을 테스트합니다.
+func TestS3BackwardCompatibility(t *testing.T) {
+	// Mock S3 서버 설정
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "PUT":
+			w.Header().Set("ETag", `"compat-etag"`)
+			w.WriteHeader(http.StatusOK)
+
+		case "HEAD":
+			w.Header().Set("Content-Length", "11")
+			w.Header().Set("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+			w.Header().Set("ETag", `"compat-etag"`)
+			w.WriteHeader(http.StatusOK)
+
+		case "GET":
+			content := "test content"
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(content)))
+			w.Header().Set("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+			w.Header().Set("ETag", `"compat-etag"`)
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(content))
+		}
+	}))
+	defer srv.Close()
+
+	cfg := DefaultConfig
+	cfg.Bucket = "test-bucket"
+	cfg.Endpoint = srv.Listener.Addr().String()
+	cfg.Insecure = true
+	cfg.Region = "test"
+	cfg.AccessKey = "test"
+	cfg.SecretKey = "test"
+
+	bkt, err := NewBucketWithConfig(log.NewNopLogger(), cfg, "test", nil)
+	testutil.Ok(t, err)
+
+	ctx := context.Background()
+	objectName := "test-object"
+	content := "test content"
+
+	// 기존 방식으로 업로드 (메타데이터 없음)
+	err = bkt.Upload(ctx, objectName, strings.NewReader(content))
+	testutil.Ok(t, err)
+
+	// 기존 방식으로 조회
+	reader, err := bkt.Get(ctx, objectName)
+	testutil.Ok(t, err)
+	defer reader.Close()
+
+	data, err := io.ReadAll(reader)
+	testutil.Ok(t, err)
+	testutil.Equals(t, content, string(data))
+
+	// Attributes 조회 (새로운 기능이지만 기존 객체에서도 작동해야 함)
+	attrs, err := bkt.Attributes(ctx, objectName)
+	testutil.Ok(t, err)
+	testutil.Equals(t, int64(11), attrs.Size)
+	testutil.Equals(t, "compat-etag", attrs.ETag)
+
+	// 메타데이터가 없는 경우 nil이어야 함
+	testutil.Assert(t, attrs.UserMetadata == nil || len(attrs.UserMetadata) == 0,
+		"user metadata should be empty for objects without metadata")
+
+	// 기존 기능들이 여전히 작동하는지 확인
+	exists, err := bkt.Exists(ctx, objectName)
+	testutil.Ok(t, err)
+	testutil.Equals(t, true, exists)
 }

@@ -306,13 +306,39 @@ func (c *Container) Attributes(_ context.Context, name string) (objstore.ObjectA
 	if name == "" {
 		return objstore.ObjectAttributes{}, errors.New("object name cannot be empty")
 	}
-	info, _, err := c.connection.Object(c.name, name)
+	info, headers, err := c.connection.Object(c.name, name)
 	if err != nil {
 		return objstore.ObjectAttributes{}, errors.Wrap(err, "get object attributes")
 	}
+
+	// 사용자 메타데이터 추출 (X-Object-Meta-* 헤더에서)
+	userMetadata := make(map[string]string)
+	for key, value := range headers {
+		if strings.HasPrefix(strings.ToLower(key), "x-object-meta-") {
+			// X-Object-Meta- 접두사 제거하고 키 정규화
+			metaKey := strings.ToLower(key[14:]) // "x-object-meta-" 길이는 14
+			if metaKey != "" && value != "" {
+				userMetadata[metaKey] = value
+			}
+		}
+	}
+
+	// 빈 메타데이터 맵은 nil로 설정
+	if len(userMetadata) == 0 {
+		userMetadata = nil
+	}
+
+	// ETag 추출 (Swift 네이티브 ETag 사용)
+	etag := ""
+	if etagValue, exists := headers["Etag"]; exists && etagValue != "" {
+		etag = etagValue
+	}
+
 	return objstore.ObjectAttributes{
 		Size:         info.Bytes,
 		LastModified: info.LastModified,
+		ETag:         etag,
+		UserMetadata: userMetadata,
 	}, nil
 }
 
@@ -348,6 +374,21 @@ func (c *Container) Upload(_ context.Context, name string, r io.Reader, opts ...
 
 	uploadOpts := objstore.ApplyObjectUploadOptions(opts...)
 
+	// 사용자 메타데이터 검증 및 변환
+	if err := objstore.ValidateUserMetadata(uploadOpts.UserMetadata); err != nil {
+		return errors.Wrap(err, "validate user metadata")
+	}
+
+	// Swift용 메타데이터 헤더 생성 (X-Object-Meta-* 형식)
+	headers := swift.Headers{}
+	if uploadOpts.UserMetadata != nil {
+		for key, value := range uploadOpts.UserMetadata {
+			// 키를 소문자로 정규화하고 X-Object-Meta- 접두사 추가
+			headerKey := fmt.Sprintf("X-Object-Meta-%s", strings.ToLower(key))
+			headers[headerKey] = value
+		}
+	}
+
 	var file io.WriteCloser
 	if size >= c.chunkSize {
 		opts := swift.LargeObjectOpts{
@@ -357,6 +398,7 @@ func (c *Container) Upload(_ context.Context, name string, r io.Reader, opts ...
 			SegmentContainer: c.segmentsContainer,
 			CheckHash:        true,
 			ContentType:      uploadOpts.ContentType,
+			Headers:          headers, // 메타데이터 헤더 추가
 		}
 		if c.useDynamicLargeObjects {
 			if file, err = c.connection.DynamicLargeObjectCreateFile(&opts); err != nil {
@@ -368,7 +410,7 @@ func (c *Container) Upload(_ context.Context, name string, r io.Reader, opts ...
 			}
 		}
 	} else {
-		if file, err = c.connection.ObjectCreate(c.name, name, true, "", uploadOpts.ContentType, swift.Headers{}); err != nil {
+		if file, err = c.connection.ObjectCreate(c.name, name, true, "", uploadOpts.ContentType, headers); err != nil {
 			return errors.Wrap(err, "create file")
 		}
 	}

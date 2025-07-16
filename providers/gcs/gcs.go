@@ -309,10 +309,34 @@ func (b *Bucket) Attributes(ctx context.Context, name string) (objstore.ObjectAt
 		return objstore.ObjectAttributes{}, err
 	}
 
-	return objstore.ObjectAttributes{
+	objAttrs := objstore.ObjectAttributes{
 		Size:         attrs.Size,
 		LastModified: attrs.Updated,
-	}, nil
+	}
+
+	// ETag 설정 - GCS 네이티브 ETag 사용
+	if attrs.Etag != "" {
+		objAttrs.ETag = attrs.Etag
+	}
+
+	// 사용자 메타데이터 추출 및 변환
+	if attrs.Metadata != nil && len(attrs.Metadata) > 0 {
+		// GCS에서 반환된 메타데이터를 일반 형식으로 역변환
+		userMetadata := make(map[string]string)
+		for key, value := range attrs.Metadata {
+			// GCS는 메타데이터 키를 소문자로 저장하므로 그대로 사용
+			// 언더스코어를 하이픈으로 다시 변환하지 않음 (일관성 유지)
+			userMetadata[key] = value
+		}
+
+		// 빈 메타데이터 필터링
+		filteredMetadata := objstore.FilterEmptyMetadata(userMetadata)
+		if filteredMetadata != nil {
+			objAttrs.UserMetadata = filteredMetadata
+		}
+	}
+
+	return objAttrs, nil
 }
 
 // Handle returns the underlying GCS bucket handle.
@@ -336,11 +360,34 @@ func (b *Bucket) Upload(ctx context.Context, name string, r io.Reader, opts ...o
 	w := b.bkt.Object(name).NewWriter(ctx)
 
 	uploadOpts := objstore.ApplyObjectUploadOptions(opts...)
+
+	// ContentType 설정
+	if uploadOpts.ContentType != "" {
+		w.ContentType = uploadOpts.ContentType
+	}
+
+	// 사용자 메타데이터 처리
+	if uploadOpts.UserMetadata != nil {
+		// 메타데이터 검증
+		if err := objstore.ValidateUserMetadata(uploadOpts.UserMetadata); err != nil {
+			return errors.Wrap(err, "invalid user metadata")
+		}
+
+		// GCS 형식으로 메타데이터 변환 (소문자 변환 및 하이픈을 언더스코어로 변경)
+		transformedMetadata := objstore.TransformMetadataForGCS(uploadOpts.UserMetadata)
+
+		// 빈 메타데이터 필터링
+		filteredMetadata := objstore.FilterEmptyMetadata(transformedMetadata)
+
+		if filteredMetadata != nil {
+			w.Metadata = filteredMetadata
+		}
+	}
+
 	// if `chunkSize` is 0, we don't set any custom value for writer's ChunkSize.
 	// It uses whatever the default value https://pkg.go.dev/google.golang.org/cloud/storage#Writer
 	if b.chunkSize > 0 {
 		w.ChunkSize = b.chunkSize
-		w.ContentType = uploadOpts.ContentType
 	}
 
 	if _, err := io.Copy(w, r); err != nil {

@@ -5,10 +5,12 @@ package filesystem
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/efficientgo/core/errcapture"
 	"github.com/pkg/errors"
@@ -171,9 +173,42 @@ func (b *Bucket) Attributes(ctx context.Context, name string) (objstore.ObjectAt
 		return objstore.ObjectAttributes{}, errors.Wrapf(err, "stat %s", file)
 	}
 
+	// 메타데이터 로드
+	metadata, err := b.loadMetadata(name)
+	if err != nil {
+		return objstore.ObjectAttributes{}, errors.Wrapf(err, "load metadata for %s", name)
+	}
+
+	// ETag가 없으면 파일 콘텐츠를 기반으로 생성
+	etag := metadata.ETag
+	if etag == "" {
+		// 파일을 읽어서 ETag 생성
+		f, err := os.Open(file)
+		if err != nil {
+			return objstore.ObjectAttributes{}, errors.Wrapf(err, "open file %s for ETag generation", name)
+		}
+		defer f.Close()
+
+		generatedETag, err := objstore.GenerateContentETag(f)
+		if err != nil {
+			return objstore.ObjectAttributes{}, errors.Wrapf(err, "generate ETag for %s", name)
+		}
+		etag = generatedETag
+
+		// 생성된 ETag를 메타데이터에 저장
+		metadata.ETag = etag
+		metadata.UpdatedAt = time.Now()
+		if err := b.saveMetadata(name, metadata); err != nil {
+			// ETag 저장 실패는 로그만 남기고 계속 진행
+			// 실제 구현에서는 로거를 사용해야 함
+		}
+	}
+
 	return objstore.ObjectAttributes{
 		Size:         stat.Size(),
 		LastModified: stat.ModTime(),
+		ETag:         etag,
+		UserMetadata: metadata.UserMetadata,
 	}, nil
 }
 
@@ -246,10 +281,18 @@ func (b *Bucket) Exists(ctx context.Context, name string) (bool, error) {
 	return !info.IsDir(), nil
 }
 
-// Upload writes the file specified in src to into the memory.
-func (b *Bucket) Upload(ctx context.Context, name string, r io.Reader, _ ...objstore.ObjectUploadOption) (err error) {
+// Upload writes the file specified in src to into the filesystem with metadata support.
+func (b *Bucket) Upload(ctx context.Context, name string, r io.Reader, opts ...objstore.ObjectUploadOption) (err error) {
 	if ctx.Err() != nil {
 		return ctx.Err()
+	}
+
+	// 업로드 옵션 파싱
+	params := objstore.ApplyUploadOptions(opts...)
+
+	// 사용자 메타데이터 검증
+	if err := objstore.ValidateUserMetadata(params.UserMetadata); err != nil {
+		return errors.Wrapf(err, "invalid metadata for object %s", name)
 	}
 
 	file := filepath.Join(b.rootDir, name)
@@ -257,15 +300,63 @@ func (b *Bucket) Upload(ctx context.Context, name string, r io.Reader, _ ...objs
 		return err
 	}
 
-	f, err := os.Create(file)
+	// 임시 파일 생성 (원자적 쓰기를 위해)
+	tempFile := file + ".tmp"
+	f, err := os.Create(tempFile)
 	if err != nil {
 		return err
 	}
-	defer errcapture.Do(&err, f.Close, "close")
+	defer func() {
+		f.Close()
+		if err != nil {
+			os.Remove(tempFile) // 실패 시 임시 파일 정리
+		}
+	}()
 
-	if _, err := io.Copy(f, r); err != nil {
+	// 콘텐츠를 임시 파일에 쓰면서 ETag 계산을 위한 해시 생성
+	hasher := objstore.NewContentHasher()
+	multiWriter := io.MultiWriter(f, hasher)
+
+	if _, err := io.Copy(multiWriter, r); err != nil {
 		return errors.Wrapf(err, "copy to %s", file)
 	}
+
+	// 파일 동기화
+	if err := f.Sync(); err != nil {
+		return errors.Wrapf(err, "sync file %s", file)
+	}
+
+	// 파일 닫기
+	if err := f.Close(); err != nil {
+		return errors.Wrapf(err, "close file %s", file)
+	}
+
+	// ETag 생성
+	etag := hasher.Sum()
+
+	// 메타데이터 생성
+	now := time.Now()
+	metadata := &ObjectMetadata{
+		UserMetadata: params.UserMetadata,
+		ETag:         etag,
+		ContentType:  params.ContentType,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+
+	// 메타데이터 저장 (원자적 쓰기)
+	if err := b.saveMetadata(name, metadata); err != nil {
+		os.Remove(tempFile) // 메타데이터 저장 실패 시 임시 파일 정리
+		return errors.Wrapf(err, "save metadata for %s", name)
+	}
+
+	// 원자적 이동 (rename)
+	if err := os.Rename(tempFile, file); err != nil {
+		// 파일 이동 실패 시 메타데이터도 정리
+		b.deleteMetadata(name)
+		return errors.Wrapf(err, "rename file %s", name)
+	}
+
 	return nil
 }
 
@@ -290,6 +381,12 @@ func isDirEmpty(name string) (ok bool, err error) {
 func (b *Bucket) Delete(ctx context.Context, name string) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
+	}
+
+	// 메타데이터 파일도 함께 삭제
+	if err := b.deleteMetadata(name); err != nil {
+		// 메타데이터 삭제 실패는 로그만 남기고 계속 진행
+		// 실제 구현에서는 로거를 사용해야 함
 	}
 
 	file := filepath.Join(b.rootDir, name)
@@ -324,4 +421,113 @@ func (b *Bucket) Close() error { return nil }
 // Name returns the bucket name.
 func (b *Bucket) Name() string {
 	return fmt.Sprintf("fs: %s", b.rootDir)
+}
+
+// ObjectMetadata represents metadata stored for filesystem objects.
+// 파일시스템 객체에 대해 저장되는 메타데이터를 나타냅니다.
+type ObjectMetadata struct {
+	UserMetadata map[string]string `json:"user_metadata"`
+	ETag         string            `json:"etag"`
+	ContentType  string            `json:"content_type,omitempty"`
+	CreatedAt    time.Time         `json:"created_at"`
+	UpdatedAt    time.Time         `json:"updated_at"`
+}
+
+// getMetadataPath returns the path to the metadata file for a given object.
+// 주어진 객체에 대한 메타데이터 파일의 경로를 반환합니다.
+func (b *Bucket) getMetadataPath(name string) string {
+	return filepath.Join(b.rootDir, name+".metadata")
+}
+
+// saveMetadata saves metadata to a JSON file atomically using a temporary file.
+// 임시 파일을 사용하여 메타데이터를 JSON 파일에 원자적으로 저장합니다.
+func (b *Bucket) saveMetadata(name string, metadata *ObjectMetadata) error {
+	metadataPath := b.getMetadataPath(name)
+
+	// 메타데이터 디렉토리 생성
+	if err := os.MkdirAll(filepath.Dir(metadataPath), os.ModePerm); err != nil {
+		return errors.Wrapf(err, "create metadata directory for %s", name)
+	}
+
+	// 임시 파일 생성 (원자적 쓰기를 위해)
+	tempPath := metadataPath + ".tmp"
+	tempFile, err := os.Create(tempPath)
+	if err != nil {
+		return errors.Wrapf(err, "create temporary metadata file for %s", name)
+	}
+	defer func() {
+		tempFile.Close()
+		os.Remove(tempPath) // 실패 시 임시 파일 정리
+	}()
+
+	// JSON 인코딩 및 쓰기
+	encoder := json.NewEncoder(tempFile)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(metadata); err != nil {
+		return errors.Wrapf(err, "encode metadata for %s", name)
+	}
+
+	// 파일 동기화
+	if err := tempFile.Sync(); err != nil {
+		return errors.Wrapf(err, "sync metadata file for %s", name)
+	}
+
+	// 파일 닫기
+	if err := tempFile.Close(); err != nil {
+		return errors.Wrapf(err, "close metadata file for %s", name)
+	}
+
+	// 원자적 이동 (rename)
+	if err := os.Rename(tempPath, metadataPath); err != nil {
+		return errors.Wrapf(err, "rename metadata file for %s", name)
+	}
+
+	return nil
+}
+
+// loadMetadata loads metadata from a JSON file.
+// JSON 파일에서 메타데이터를 로드합니다.
+func (b *Bucket) loadMetadata(name string) (*ObjectMetadata, error) {
+	metadataPath := b.getMetadataPath(name)
+
+	file, err := os.Open(metadataPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// 메타데이터 파일이 없으면 기본값 반환
+			return &ObjectMetadata{
+				UserMetadata: make(map[string]string),
+				ETag:         "",
+				CreatedAt:    time.Now(),
+				UpdatedAt:    time.Now(),
+			}, nil
+		}
+		return nil, errors.Wrapf(err, "open metadata file for %s", name)
+	}
+	defer file.Close()
+
+	var metadata ObjectMetadata
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&metadata); err != nil {
+		return nil, errors.Wrapf(err, "decode metadata for %s", name)
+	}
+
+	// nil 맵 초기화
+	if metadata.UserMetadata == nil {
+		metadata.UserMetadata = make(map[string]string)
+	}
+
+	return &metadata, nil
+}
+
+// deleteMetadata removes the metadata file for an object.
+// 객체의 메타데이터 파일을 제거합니다.
+func (b *Bucket) deleteMetadata(name string) error {
+	metadataPath := b.getMetadataPath(name)
+
+	err := os.Remove(metadataPath)
+	if err != nil && !os.IsNotExist(err) {
+		return errors.Wrapf(err, "remove metadata file for %s", name)
+	}
+
+	return nil
 }

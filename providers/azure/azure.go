@@ -345,10 +345,31 @@ func (b *Bucket) Attributes(ctx context.Context, name string) (objstore.ObjectAt
 	if err != nil {
 		return objstore.ObjectAttributes{}, err
 	}
-	return objstore.ObjectAttributes{
+
+	attrs := objstore.ObjectAttributes{
 		Size:         *resp.ContentLength,
 		LastModified: *resp.LastModified,
-	}, nil
+	}
+
+	// ETag 추가 (Azure 네이티브 ETag 사용)
+	if resp.ETag != nil {
+		attrs.ETag = string(*resp.ETag)
+	}
+
+	// 사용자 메타데이터 추가
+	if resp.Metadata != nil && len(resp.Metadata) > 0 {
+		userMetadata := make(map[string]string, len(resp.Metadata))
+		for key, valuePtr := range resp.Metadata {
+			if valuePtr != nil {
+				userMetadata[key] = *valuePtr
+			}
+		}
+		attrs.UserMetadata = userMetadata
+
+		level.Debug(b.logger).Log("msg", "retrieved blob metadata", "blob", name, "metadata_keys", len(userMetadata))
+	}
+
+	return attrs, nil
 }
 
 // Exists checks if the given object exists.
@@ -370,12 +391,34 @@ func (b *Bucket) Upload(ctx context.Context, name string, r io.Reader, uploadOpt
 	blobClient := b.containerClient.NewBlockBlobClient(name)
 
 	uploadOptions := objstore.ApplyObjectUploadOptions(uploadOpts...)
+
+	// 사용자 메타데이터 검증 및 변환
+	var metadata map[string]*string
+	if uploadOptions.UserMetadata != nil {
+		// 메타데이터 검증
+		if err := objstore.ValidateUserMetadata(uploadOptions.UserMetadata); err != nil {
+			return errors.Wrap(err, "invalid user metadata")
+		}
+
+		// Azure용 메타데이터 변환
+		transformedMetadata := objstore.TransformMetadataForAzure(uploadOptions.UserMetadata)
+
+		// Azure SDK가 요구하는 *string 형태로 변환
+		metadata = make(map[string]*string, len(transformedMetadata))
+		for key, value := range transformedMetadata {
+			metadata[key] = &value
+		}
+
+		level.Debug(b.logger).Log("msg", "uploading blob with metadata", "blob", name, "metadata_keys", len(metadata))
+	}
+
 	opts := &blockblob.UploadStreamOptions{
 		BlockSize:   3 * 1024 * 1024,
 		Concurrency: 4,
 		HTTPHeaders: &blob.HTTPHeaders{
 			BlobContentType: &uploadOptions.ContentType,
 		},
+		Metadata: metadata,
 	}
 	if _, err := blobClient.UploadStream(ctx, r, opts); err != nil {
 		return errors.Wrapf(err, "cannot upload Azure blob, address: %s", name)
